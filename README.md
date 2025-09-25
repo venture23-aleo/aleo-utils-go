@@ -2,7 +2,7 @@
 
 This is a helper library for Golang, it provides selected functions (see below) from the Aleo [library](https://github.com/AleoHQ/snarkVM) with correct encoding.
 
-This library is using WebAssembly under the hood, which is compiled to `wasm32-wasi`. It is using the library based on https://github.com/AleoHQ/snarkVM `console` crate. The WebAssembly program is embed into the binary using `go:embed`.
+This library is using WebAssembly under the hood, which is compiled to `wasm32-wasi`. It is using the library based on <https://github.com/AleoHQ/snarkVM> `console` crate. The WebAssembly program is embed into the binary using `go:embed`.
 
 ## Building WASM module before using
 
@@ -16,12 +16,12 @@ Available functions:
 
 | Function | Arguments | Return type | Description |
 | --- | --- | --- | --- |
-| `NewPrivateKey` | | `(key string, address string, err error)` | Generates a new Aleo private key, returns it with it's public address |
+| `NewPrivateKey` | | `(key []byte, address string, err error)` | Generates a new Aleo private key, returns it with it's public address. The caller should zero the returned slice after use using `ZeroizePrivateKey` |
 | `FormatMessage` | <ul><li>`message []byte` - buffer to format for Leo</li><li>`targetChunks int` - number of desired chunks in the resulting struct, where every chunk is a struct of 32 `u128`s. Allowed: 1-32.</li></ul> | `(formattedMessage []byte, err error)` | Formats a byte buffer as a nested struct with the specified number of 512-byte chunks. The result is returned as bytes of the string representation of the struct. |
 | `RecoverMessage` | `formattedMessage []byte` | `(message []byte, err error)` | Recovers original byte buffer from a formatted message created with `FormatMessage` |
 | `HashMessageToString` | `message []byte` | `(hash string, err error)` | Hashes a message using Poseidon8 Leo function, and returns a string representation of a resulting `u128`, meaning it can be used as a literal in a Leo program, e.g. "12345u128" |
 | `HashMessage` | `message []byte` | `(hash []byte, err error)` | Hashes a message using Poseidon8 Leo function, and returns a byte representation of a resulting `u128`, meaning it has to be converted to Leo `u128` type before it can be used as a literal. Use this function if you want to sign a message that is too big and verify it in a contract. If you don't plan to verify it in contract, `HashMessageToString` will work as well |
-| `Sign` | <ul><li>`key string` - private key for signing, e.g. from `NewPrivateKey`</li><li>`message []byte` - a message to sign, must be string or byte representation of Leo `u128` value</li></ul> | `(signature string, err error)` | Signs data using private key, returns the signature as a string representation of Leo `signature` value |
+| `Sign` | <ul><li>`key []byte` - private key for signing, e.g. from `NewPrivateKey`</li><li>`message []byte` - a message to sign, must be string or byte representation of Leo `u128` value</li></ul> | `(signature string, err error)` | Signs data using private key, returns the signature as a string representation of Leo `signature` value. The private key bytes are wiped from WASM memory immediately after signing |
 
 Create a wrapper using `NewWrapper`. It will return a wrapper manager, runtime close function, and optionally an error. Then use
 wrapper manager to create a new session.
@@ -44,7 +44,8 @@ func main() {
   }
 
   // session provides access to the functionality
-  session.NewPrivateKey()
+  key, addr, _ := session.NewPrivateKey()
+  defer ZeroizePrivateKey(key) // best-effort zeroization
 
   // calling closeFn will destroy WASM runtime,
   // all wrapper functions will panic if called after the runtime was closed

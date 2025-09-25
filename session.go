@@ -10,19 +10,22 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
-var (
-	ErrNoModule = errors.New("session module is closed")
-)
+var ErrNoModule = errors.New("session module is closed")
 
 // Provides access to wrapper functionality. A session is not goroutine safe so
 // you need to create a new one for every goroutine
 type Session interface {
-	NewPrivateKey() (key string, address string, err error)
+	// NewPrivateKey returns a newly generated private key as a byte slice and the
+	// corresponding address. The caller is responsible for zeroizing the returned
+	// slice when it is no longer needed (see ZeroizePrivateKey).
+	NewPrivateKey() (key []byte, address string, err error)
 	FormatMessage(message []byte, targetChunks int) (formattedMessage []byte, err error)
 	RecoverMessage(formattedMessage []byte) (message []byte, err error)
 	HashMessageToString(message []byte) (hash string, err error)
 	HashMessage(message []byte) (hash []byte, err error)
-	Sign(key string, message []byte) (signature string, err error)
+	// Sign creates an Aleo-compatible Schnorr signature. The private key is not
+	// copied as a string and is wiped from WASM memory immediately after use.
+	Sign(key []byte, message []byte) (signature string, err error)
 
 	Close()
 }
@@ -53,9 +56,9 @@ func (session *aleoWrapperSession) Close() {
 }
 
 // NewPrivateKey generates a new Aleo private key, returns it's string representation and the address derived from that private key.
-func (s *aleoWrapperSession) NewPrivateKey() (key string, address string, err error) {
+func (s *aleoWrapperSession) NewPrivateKey() (key []byte, address string, err error) {
 	if s.mod == nil || s.mod.IsClosed() {
-		return "", "", ErrNoModule
+		return nil, "", ErrNoModule
 	}
 
 	defer func() {
@@ -69,7 +72,7 @@ func (s *aleoWrapperSession) NewPrivateKey() (key string, address string, err er
 			default:
 				err = errors.New("unknown panic")
 			}
-			key = ""
+			key = nil
 			address = ""
 		}
 	}()
@@ -82,35 +85,32 @@ func (s *aleoWrapperSession) NewPrivateKey() (key string, address string, err er
 		return
 	}
 	if privKeyPtr[0] == 0 {
-		return "", "", errors.New("failed to create new private key")
+		return nil, "", errors.New("failed to create new private key")
 	}
 
 	// read wasm memory at pointer for the private key string
-	privKey, ok := s.mod.Memory().Read(uint32(privKeyPtr[0]), PRIVATE_KEY_SIZE)
+	privKeyWasm, ok := s.mod.Memory().Read(uint32(privKeyPtr[0]), PRIVATE_KEY_SIZE)
 	if !ok {
-		return "", "", errors.New("failed to create new private key")
+		return nil, "", errors.New("failed to create new private key")
 	}
+	key = make([]byte, PRIVATE_KEY_SIZE)
+	copy(key, privKeyWasm)
 	defer s.deallocate.Call(s.ctx, privKeyPtr[0], PRIVATE_KEY_SIZE)
-
-	// since memory read returns a slice of wasm memory buffer, it needs to be copied
-	// to avoid our returned slice being wiped when wasm memory is wiped.
-	// explicit copy is not needed since we create a string, which copies the slice instead of referencing it
-	key = string(privKey)
 
 	// get public address from the private key, reuse the returned value from private key generation
 	addressPtr, err := s.getAddress.Call(s.ctx, privKeyPtr[0], PRIVATE_KEY_SIZE)
 	if err != nil {
 		log.Println("get_address error:", err)
-		return "", "", errors.New("failed to get address from the generated private key")
+		return nil, "", errors.New("failed to get address from the generated private key")
 	}
 	if addressPtr[0] == 0 {
-		return "", "", errors.New("internal error when getting address from the generated private key")
+		return nil, "", errors.New("internal error when getting address from the generated private key")
 	}
 
 	// read address from wasm memory
 	addr, ok := s.mod.Memory().Read(uint32(addressPtr[0]), ADDRESS_SIZE)
 	if !ok {
-		return "", "", errors.New("failed to convert generated private key to address")
+		return nil, "", errors.New("failed to convert generated private key to address")
 	}
 	defer s.deallocate.Call(s.ctx, addressPtr[0], ADDRESS_SIZE)
 
@@ -118,6 +118,11 @@ func (s *aleoWrapperSession) NewPrivateKey() (key string, address string, err er
 	// to avoid our returned slice being wiped when wasm memory is wiped.
 	// explicit copy is not needed since we create a string, which copies the slice instead of referencing it
 	address = string(addr)
+
+	// Now that the address has been derived and we no longer need the key inside
+	// WASM memory, wipe the original region (best effort) before returning.
+	zero := make([]byte, PRIVATE_KEY_SIZE)
+	_ = s.mod.Memory().Write(uint32(privKeyPtr[0]), zero)
 
 	return
 }
@@ -421,7 +426,7 @@ func (s *aleoWrapperSession) HashMessage(message []byte) (hash []byte, err error
 // message's string representation.
 //
 // The message must be a string or little-endian byte representation of a Leo U128.
-func (s *aleoWrapperSession) Sign(key string, message []byte) (signature string, err error) {
+func (s *aleoWrapperSession) Sign(key []byte, message []byte) (signature string, err error) {
 	if s.mod == nil || s.mod.IsClosed() {
 		return "", ErrNoModule
 	}
@@ -470,7 +475,7 @@ func (s *aleoWrapperSession) Sign(key string, message []byte) (signature string,
 	defer s.deallocate.Call(s.ctx, privateKeyPtr[0], PRIVATE_KEY_SIZE)
 
 	// write private key to wasm memory
-	ok = s.mod.Memory().Write(uint32(privateKeyPtr[0]), []byte(key))
+	ok = s.mod.Memory().Write(uint32(privateKeyPtr[0]), key)
 	if !ok {
 		return "", errors.New("failed to write private key to memory for signing")
 	}
@@ -491,6 +496,10 @@ func (s *aleoWrapperSession) Sign(key string, message []byte) (signature string,
 		return "", errors.New("failed to sign message")
 	}
 	defer s.deallocate.Call(s.ctx, signaturePtr[0], SIGNATURE_SIZE)
+
+	// wipe the private key bytes in WASM memory before deallocation (best effort)
+	zero := make([]byte, PRIVATE_KEY_SIZE)
+	_ = s.mod.Memory().Write(uint32(privateKeyPtr[0]), zero)
 
 	// since memory read returns a slice of wasm memory buffer, it needs to be copied
 	// to avoid our returned slice being wiped when wasm memory is wiped.

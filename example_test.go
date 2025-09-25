@@ -57,7 +57,7 @@ func Example() {
 	log.Println("Signature:", signature)
 	log.Println("Address:", address)
 	log.Println("Poseidon8 hash:", hashedMessage)
-	log.Println("Private key:", privKey)
+	log.Println("Private key:", string(privKey))
 
 	// Output:
 }
