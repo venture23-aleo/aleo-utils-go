@@ -74,13 +74,21 @@ func NewWrapper() (wrapper Wrapper, closeFn func(), err error) {
 
 	runtimeConfig := wazero.NewRuntimeConfigCompiler()
 	runtime := wazero.NewRuntimeWithConfig(ctx, runtimeConfig)
+	// If we fail later in this function, make sure to close the runtime to avoid leaks.
+	defer func() {
+		if err != nil && runtime != nil {
+			_ = runtime.Close(ctx)
+		}
+	}()
 
 	// export some wasi system functions
 	wasi_snapshot_preview1.MustInstantiate(ctx, runtime)
 
 	// export logging function to the guest
 	hostBuilder := runtime.NewHostModuleBuilder("env")
-	hostBuilder.NewFunctionBuilder().WithFunc(logString).Export("host_log_string").Instantiate(ctx)
+	if _, hbErr := hostBuilder.NewFunctionBuilder().WithFunc(logString).Export("host_log_string").Instantiate(ctx); hbErr != nil {
+		return nil, nil, fmt.Errorf("failed to instantiate host module: %w", hbErr)
+	}
 
 	moduleConfig := wazero.NewModuleConfig().WithRandSource(rand.Reader)
 
@@ -113,18 +121,43 @@ func (s *aleoWrapper) NewSession() (Session, error) {
 		return nil, fmt.Errorf("failed to instantiate wrapper session: %w", err)
 	}
 
+	// Resolve and validate all required exports explicitly.
+	required := map[string]api.Function{
+		"new_private_key":            mod.ExportedFunction("new_private_key"),
+		"get_address":                mod.ExportedFunction("get_address"),
+		"sign":                       mod.ExportedFunction("sign"),
+		"alloc":                      mod.ExportedFunction("alloc"),
+		"dealloc":                    mod.ExportedFunction("dealloc"),
+		"hash_message":               mod.ExportedFunction("hash_message"),
+		"hash_message_bytes":         mod.ExportedFunction("hash_message_bytes"),
+		"format_message":             mod.ExportedFunction("format_message"),
+		"formatted_message_to_bytes": mod.ExportedFunction("formatted_message_to_bytes"),
+	}
+
+	missing := make([]string, 0)
+	for name, fn := range required {
+		if fn == nil {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		// Ensure we don't leak a module instance if it's unusable
+		_ = mod.Close(context.Background())
+		return nil, fmt.Errorf("missing required wasm exports: %v", missing)
+	}
+
 	session := &aleoWrapperSession{
 		mod:              mod,
 		ctx:              context.Background(),
-		newPrivateKey:    mod.ExportedFunction("new_private_key"),
-		getAddress:       mod.ExportedFunction("get_address"),
-		sign:             mod.ExportedFunction("sign"),
-		allocate:         mod.ExportedFunction("alloc"),
-		deallocate:       mod.ExportedFunction("dealloc"),
-		hashMessage:      mod.ExportedFunction("hash_message"),
-		hashMessageBytes: mod.ExportedFunction("hash_message_bytes"),
-		formatMessage:    mod.ExportedFunction("format_message"),
-		recoverMessage:   mod.ExportedFunction("formatted_message_to_bytes"),
+		newPrivateKey:    required["new_private_key"],
+		getAddress:       required["get_address"],
+		sign:             required["sign"],
+		allocate:         required["alloc"],
+		deallocate:       required["dealloc"],
+		hashMessage:      required["hash_message"],
+		hashMessageBytes: required["hash_message_bytes"],
+		formatMessage:    required["format_message"],
+		recoverMessage:   required["formatted_message_to_bytes"],
 	}
 
 	return session, nil
