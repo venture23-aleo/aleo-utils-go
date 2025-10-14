@@ -7,6 +7,8 @@ require (
 	github.com/venture23-aleo/aleo-utils-go v1.0.0
 )
 
+replace github.com/venture23-aleo/aleo-utils-go => ../..
+
 require (
 	github.com/go-jose/go-jose/v4 v4.0.4 // indirect
 	github.com/tetratelabs/wazero v1.8.1 // indirect

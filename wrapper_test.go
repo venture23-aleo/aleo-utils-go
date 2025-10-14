@@ -44,8 +44,8 @@ func TestAleoWrapper_NewPrivateKey(t *testing.T) {
 		t.Fatalf("AleoWrapper.NewPrivateKey() error = %v\n", err)
 		return
 	}
-	if gotKey == "" {
-		t.Errorf("AleoWrapper.NewPrivateKey() gotKey = %v, want not empty\n", gotKey)
+	if len(gotKey) == 0 {
+		t.Errorf("AleoWrapper.NewPrivateKey() gotKey is empty, want not empty\n")
 	}
 	if gotAddress == "" {
 		t.Errorf("AleoWrapper.NewPrivateKey() gotAddress = %v, want not empty\n", gotAddress)
@@ -122,7 +122,7 @@ func TestAleoWrapper_FormatMessage(t *testing.T) {
 
 func TestAleoWrapper_Sign(t *testing.T) {
 	type args struct {
-		key     string
+		key     []byte
 		message []byte
 	}
 
@@ -150,7 +150,7 @@ func TestAleoWrapper_Sign(t *testing.T) {
 		{
 			name: "empty key",
 			args: args{
-				key:     "",
+				key:     []byte{},
 				message: []byte(""),
 			},
 			wantErr: true,
@@ -158,7 +158,7 @@ func TestAleoWrapper_Sign(t *testing.T) {
 		{
 			name: "invalid key",
 			args: args{
-				key:     "12345678901234567890123456789012345678901234567890123456789",
+				key:     []byte("12345678901234567890123456789012345678901234567890123456789"),
 				message: []byte(""),
 			},
 			wantErr: true,
