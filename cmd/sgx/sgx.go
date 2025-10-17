@@ -71,7 +71,7 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	signature, err := s.Sign("APrivateKey1zkpEem71u7U75h5VodKNgyR37aGJBj4ZTgagCHm3qsuz5PU", []byte(hashedReport))
+	signature, err := s.Sign([]byte("APrivateKey1zkpEem71u7U75h5VodKNgyR37aGJBj4ZTgagCHm3qsuz5PU"), []byte(hashedReport))
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -93,5 +93,5 @@ func main() {
 	b.WriteString(fmt.Sprintf("Hashed report = \"%s\"\n", hashedReport))
 	b.WriteString(fmt.Sprintf("Signature = \"%s\"\n", signature))
 
-	os.WriteFile("output.txt", []byte(b.String()), 0666)
+	os.WriteFile("output.txt", []byte(b.String()), 0o666)
 }
