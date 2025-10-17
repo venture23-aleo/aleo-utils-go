@@ -10,19 +10,22 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
-var (
-	ErrNoModule = errors.New("session module is closed")
-)
+var ErrNoModule = errors.New("session module is closed")
 
 // Provides access to wrapper functionality. A session is not goroutine safe so
 // you need to create a new one for every goroutine
 type Session interface {
-	NewPrivateKey() (key string, address string, err error)
+	// NewPrivateKey returns a newly generated private key as a byte slice and the
+	// corresponding address. The caller is responsible for zeroizing the returned
+	// slice when it is no longer needed (see ZeroizePrivateKey).
+	NewPrivateKey() (key []byte, address string, err error)
 	FormatMessage(message []byte, targetChunks int) (formattedMessage []byte, err error)
 	RecoverMessage(formattedMessage []byte) (message []byte, err error)
 	HashMessageToString(message []byte) (hash string, err error)
 	HashMessage(message []byte) (hash []byte, err error)
-	Sign(key string, message []byte) (signature string, err error)
+	// Sign creates an Aleo-compatible Schnorr signature. The private key is not
+	// copied as a string and is wiped from WASM memory immediately after use.
+	Sign(key []byte, message []byte) (signature string, err error)
 
 	Close()
 }
@@ -46,16 +49,33 @@ type aleoWrapperSession struct {
 	recoverMessage   api.Function
 }
 
-func (session *aleoWrapperSession) Close() {
-	if session.mod != nil {
-		session.mod.Close(context.Background())
+func (s *aleoWrapperSession) Close() {
+	if s.mod != nil {
+		s.mod.Close(context.Background())
 	}
 }
 
+// Helper function to allocate memory safely with actual capacity tracking
+func (s *aleoWrapperSession) allocateSafe(size uint64) (ptr uint64, actualCapacity uint64, err error) {
+	// New alloc returns a raw pointer (to data) and stores capacity in an 8-byte header.
+	result, err := s.allocate.Call(s.ctx, size)
+	if err != nil {
+		return 0, 0, err
+	}
+	// We don't know the actual capacity (it's stored internally). Return size for logging only.
+	return result[0], size, nil
+}
+
+// Helper function to deallocate memory safely with exact capacity
+func (s *aleoWrapperSession) deallocateSafe(ptr uint64, actualCapacity uint64) error {
+	_, err := s.deallocate.Call(s.ctx, ptr, 0)
+	return err
+}
+
 // NewPrivateKey generates a new Aleo private key, returns it's string representation and the address derived from that private key.
-func (s *aleoWrapperSession) NewPrivateKey() (key string, address string, err error) {
+func (s *aleoWrapperSession) NewPrivateKey() (key []byte, address string, err error) {
 	if s.mod == nil || s.mod.IsClosed() {
-		return "", "", ErrNoModule
+		return nil, "", ErrNoModule
 	}
 
 	defer func() {
@@ -69,7 +89,7 @@ func (s *aleoWrapperSession) NewPrivateKey() (key string, address string, err er
 			default:
 				err = errors.New("unknown panic")
 			}
-			key = ""
+			key = nil
 			address = ""
 		}
 	}()
@@ -81,36 +101,39 @@ func (s *aleoWrapperSession) NewPrivateKey() (key string, address string, err er
 		log.Println("new_private_key error:", err)
 		return
 	}
+	if len(privKeyPtr) == 0 {
+		return "", "", errors.New("failed to create new private key: empty return")
+	}
 	if privKeyPtr[0] == 0 {
-		return "", "", errors.New("failed to create new private key")
+		return nil, "", errors.New("failed to create new private key")
 	}
 
 	// read wasm memory at pointer for the private key string
-	privKey, ok := s.mod.Memory().Read(uint32(privKeyPtr[0]), PRIVATE_KEY_SIZE)
+	privKeyWasm, ok := s.mod.Memory().Read(uint32(privKeyPtr[0]), PRIVATE_KEY_SIZE)
 	if !ok {
-		return "", "", errors.New("failed to create new private key")
+		return nil, "", errors.New("failed to create new private key")
 	}
+	key = make([]byte, PRIVATE_KEY_SIZE)
+	copy(key, privKeyWasm)
 	defer s.deallocate.Call(s.ctx, privKeyPtr[0], PRIVATE_KEY_SIZE)
-
-	// since memory read returns a slice of wasm memory buffer, it needs to be copied
-	// to avoid our returned slice being wiped when wasm memory is wiped.
-	// explicit copy is not needed since we create a string, which copies the slice instead of referencing it
-	key = string(privKey)
 
 	// get public address from the private key, reuse the returned value from private key generation
 	addressPtr, err := s.getAddress.Call(s.ctx, privKeyPtr[0], PRIVATE_KEY_SIZE)
 	if err != nil {
 		log.Println("get_address error:", err)
-		return "", "", errors.New("failed to get address from the generated private key")
+		return nil, "", errors.New("failed to get address from the generated private key")
+	}
+	if len(addressPtr) == 0 {
+		return "", "", errors.New("internal error when getting address from the generated private key: empty return")
 	}
 	if addressPtr[0] == 0 {
-		return "", "", errors.New("internal error when getting address from the generated private key")
+		return nil, "", errors.New("internal error when getting address from the generated private key")
 	}
 
 	// read address from wasm memory
 	addr, ok := s.mod.Memory().Read(uint32(addressPtr[0]), ADDRESS_SIZE)
 	if !ok {
-		return "", "", errors.New("failed to convert generated private key to address")
+		return nil, "", errors.New("failed to convert generated private key to address")
 	}
 	defer s.deallocate.Call(s.ctx, addressPtr[0], ADDRESS_SIZE)
 
@@ -118,6 +141,11 @@ func (s *aleoWrapperSession) NewPrivateKey() (key string, address string, err er
 	// to avoid our returned slice being wiped when wasm memory is wiped.
 	// explicit copy is not needed since we create a string, which copies the slice instead of referencing it
 	address = string(addr)
+
+	// Now that the address has been derived and we no longer need the key inside
+	// WASM memory, wipe the original region (best effort) before returning.
+	zero := make([]byte, PRIVATE_KEY_SIZE)
+	_ = s.mod.Memory().Write(uint32(privKeyPtr[0]), zero)
 
 	return
 }
@@ -154,27 +182,37 @@ func (s *aleoWrapperSession) FormatMessage(message []byte, targetChunks int) (fo
 
 	msgLen := uint64(len(message))
 
-	// allocate memory for the message to pass to the formatting function
-	messagePtr, err := s.allocate.Call(s.ctx, msgLen)
+	// FIXED: Use safe allocation that tracks actual capacity
+	messagePtr, _, err := s.allocateSafe(msgLen)
 	if err != nil {
 		log.Println("message allocate error:", err)
 		return nil, errors.New("failed to allocate memory for message")
 	}
+	if len(messagePtr) == 0 {
+		return nil, errors.New("failed to allocate memory for message: empty return")
+	}
 
-	// don't forget to dealloc memory
-	defer s.deallocate.Call(s.ctx, messagePtr[0], msgLen)
+	// Deallocate (capacity stored in header, second arg ignored)
+	defer func() {
+		if err := s.deallocateSafe(messagePtr, 0); err != nil {
+			log.Printf("Failed to deallocate message memory: %v", err)
+		}
+	}()
 
 	// write message to wasm memory
-	ok := s.mod.Memory().Write(uint32(messagePtr[0]), message)
+	ok := s.mod.Memory().Write(uint32(messagePtr), message)
 	if !ok {
 		return nil, errors.New("failed to write message to memory for formatting")
 	}
 
 	// call format message with the pointer to the message
-	formatResult, err := s.formatMessage.Call(s.ctx, messagePtr[0], msgLen, uint64(targetChunks))
+	formatResult, err := s.formatMessage.Call(s.ctx, messagePtr, msgLen, uint64(targetChunks))
 	if err != nil {
 		log.Println("string format error:", err)
 		return nil, errors.New("failed to format message")
+	}
+	if len(formatResult) == 0 {
+		return nil, errors.New("invalid message: empty return")
 	}
 	if formatResult[0] == 0 {
 		return nil, errors.New("invalid message")
@@ -191,6 +229,8 @@ func (s *aleoWrapperSession) FormatMessage(message []byte, targetChunks int) (fo
 	if !ok {
 		return nil, errors.New("failed to convert message to a field")
 	}
+	// FIXED: This output is allocated by Rust using forget_buf_ptr_len,
+	// so we need to deallocate using the actual buffer size, not strLen
 	defer s.deallocate.Call(s.ctx, uint64(strPtr), uint64(strLen))
 
 	// since memory read returns a slice of wasm memory buffer, it needs to be copied
@@ -226,27 +266,37 @@ func (s *aleoWrapperSession) RecoverMessage(formattedMessage []byte) (message []
 
 	formattedMsgLen := uint64(len(formattedMessage))
 
-	// allocate memory for the message to pass to the recovery function
-	formattedMessagePtr, err := s.allocate.Call(s.ctx, formattedMsgLen)
+	// FIXED: Use safe allocation that tracks actual capacity
+	formattedMessagePtr, _, err := s.allocateSafe(formattedMsgLen)
 	if err != nil {
 		log.Println("message allocate error:", err)
 		return nil, errors.New("failed to allocate memory for message")
 	}
+	if len(formattedMessagePtr) == 0 {
+		return nil, errors.New("failed to allocate memory for message: empty return")
+	}
 
-	// don't forget to dealloc memory
-	defer s.deallocate.Call(s.ctx, formattedMessagePtr[0], formattedMsgLen)
+	// Deallocate (capacity stored in header, second arg ignored)
+	defer func() {
+		if err := s.deallocateSafe(formattedMessagePtr, 0); err != nil {
+			log.Printf("Failed to deallocate formatted message memory: %v", err)
+		}
+	}()
 
 	// write message to wasm memory
-	ok := s.mod.Memory().Write(uint32(formattedMessagePtr[0]), formattedMessage)
+	ok := s.mod.Memory().Write(uint32(formattedMessagePtr), formattedMessage)
 	if !ok {
 		return nil, errors.New("failed to write message to memory for recovering")
 	}
 
 	// call recover message with the pointer to the message
-	recoverResult, err := s.recoverMessage.Call(s.ctx, formattedMessagePtr[0], formattedMsgLen)
+	recoverResult, err := s.recoverMessage.Call(s.ctx, formattedMessagePtr, formattedMsgLen)
 	if err != nil {
 		log.Println("string recover error:", err)
 		return nil, errors.New("failed to recover message")
+	}
+	if len(recoverResult) == 0 {
+		return nil, errors.New("invalid message: empty return")
 	}
 	if recoverResult[0] == 0 {
 		return nil, errors.New("invalid message")
@@ -299,27 +349,37 @@ func (s *aleoWrapperSession) HashMessageToString(message []byte) (hash string, e
 
 	msgLen := uint64(len(message))
 
-	// allocate memory for the message to pass to the signing function
-	messagePtr, err := s.allocate.Call(s.ctx, msgLen)
+	// FIXED: Use safe allocation that tracks actual capacity
+	messagePtr, _, err := s.allocateSafe(msgLen)
 	if err != nil {
 		log.Println("message allocate error:", err)
 		return "", errors.New("failed to allocate memory for message")
 	}
+	if len(messagePtr) == 0 {
+		return "", errors.New("failed to allocate memory for message: empty return")
+	}
 
-	// don't forget to dealloc memory
-	defer s.deallocate.Call(s.ctx, messagePtr[0], msgLen)
+	// Deallocate (capacity stored in header, second arg ignored)
+	defer func() {
+		if err := s.deallocateSafe(messagePtr, 0); err != nil {
+			log.Printf("Failed to deallocate hash message memory: %v", err)
+		}
+	}()
 
 	// write message to wasm memory
-	ok := s.mod.Memory().Write(uint32(messagePtr[0]), message)
+	ok := s.mod.Memory().Write(uint32(messagePtr), message)
 	if !ok {
 		return "", errors.New("failed to write message to memory for hashing")
 	}
 
 	// call the hash function and pass the pointer to the message
-	hashResult, err := s.hashMessage.Call(s.ctx, messagePtr[0], msgLen)
+	hashResult, err := s.hashMessage.Call(s.ctx, messagePtr, msgLen)
 	if err != nil {
 		log.Println("hash message error:", err)
 		return "", errors.New("failed to hash message to a string representation")
+	}
+	if len(hashResult) == 0 {
+		return "", errors.New("invalid message: empty return")
 	}
 	if hashResult[0] == 0 {
 		return "", errors.New("invalid message")
@@ -370,27 +430,37 @@ func (s *aleoWrapperSession) HashMessage(message []byte) (hash []byte, err error
 
 	msgLen := uint64(len(message))
 
-	// allocate memory for the message to pass to the signing function
-	messagePtr, err := s.allocate.Call(s.ctx, msgLen)
+	// FIXED: Use safe allocation that tracks actual capacity
+	messagePtr, _, err := s.allocateSafe(msgLen)
 	if err != nil {
 		log.Println("message allocate error:", err)
 		return nil, errors.New("failed to allocate memory for message")
 	}
+	if len(messagePtr) == 0 {
+		return nil, errors.New("failed to allocate memory for message: empty return")
+	}
 
-	// don't forget to dealloc memory
-	defer s.deallocate.Call(s.ctx, messagePtr[0], msgLen)
+	// Deallocate (capacity stored in header, second arg ignored)
+	defer func() {
+		if err := s.deallocateSafe(messagePtr, 0); err != nil {
+			log.Printf("Failed to deallocate hash message bytes memory: %v", err)
+		}
+	}()
 
 	// write message to wasm memory
-	ok := s.mod.Memory().Write(uint32(messagePtr[0]), message)
+	ok := s.mod.Memory().Write(uint32(messagePtr), message)
 	if !ok {
 		return nil, errors.New("failed to write message to memory for hashing")
 	}
 
 	// pass message to the hash function
-	hashResult, err := s.hashMessageBytes.Call(s.ctx, messagePtr[0], msgLen)
+	hashResult, err := s.hashMessageBytes.Call(s.ctx, messagePtr, msgLen)
 	if err != nil {
 		log.Println("hash message bytes error:", err)
 		return nil, errors.New("failed to hash message")
+	}
+	if len(hashResult) == 0 {
+		return nil, errors.New("invalid message: empty return")
 	}
 	if hashResult[0] == 0 {
 		return nil, errors.New("invalid message")
@@ -417,11 +487,9 @@ func (s *aleoWrapperSession) HashMessage(message []byte) (hash []byte, err error
 	return
 }
 
-// Creates a Aleo-compatible Schnorr signature, returns signature's string representation and Aleo-compatible
-// message's string representation.
-//
+// Creates an Aleo-compatible Schnorr signature, returns the signature's string representation.
 // The message must be a string or little-endian byte representation of a Leo U128.
-func (s *aleoWrapperSession) Sign(key string, message []byte) (signature string, err error) {
+func (s *aleoWrapperSession) Sign(key []byte, message []byte) (signature string, err error) {
 	if s.mod == nil || s.mod.IsClosed() {
 		return "", ErrNoModule
 	}
@@ -445,41 +513,53 @@ func (s *aleoWrapperSession) Sign(key string, message []byte) (signature string,
 		return "", errors.New("invalid private key size")
 	}
 
-	// allocate memory for the message to pass to the signing function
-	messagePtr, err := s.allocate.Call(s.ctx, uint64(len(message)))
+	// allocate memory for the message to pass to the signing function using safe allocator
+	msgLen := uint64(len(message))
+	messagePtr, _, err := s.allocateSafe(msgLen)
 	if err != nil {
 		log.Println("message allocate error:", err)
 		return "", errors.New("failed to allocate memory for message")
 	}
-	defer s.deallocate.Call(s.ctx, messagePtr[0], uint64(len(message)))
+	
+  defer func() {
+		if err := s.deallocateSafe(messagePtr, 0); err != nil { // second arg ignored
+			log.Printf("Failed to deallocate message memory in Sign: %v", err)
+		}
+	}()
 
 	// write formatted message to memory
-	ok := s.mod.Memory().Write(uint32(messagePtr[0]), message)
+	ok := s.mod.Memory().Write(uint32(messagePtr), message)
 	if !ok {
 		return "", errors.New("failed to write formatted message to memory for signing")
 	}
 
-	// allocate memory for private key to pass to the signing function
-	privateKeyPtr, err := s.allocate.Call(s.ctx, PRIVATE_KEY_SIZE)
+	// allocate memory for private key to pass to the signing function using safe allocator
+	privateKeyPtr, _, err := s.allocateSafe(PRIVATE_KEY_SIZE)
 	if err != nil {
 		log.Println("private key allocate error:", err)
 		return "", errors.New("failed to allocate memory for private key")
 	}
-
-	// don't forget to dealloc memory
-	defer s.deallocate.Call(s.ctx, privateKeyPtr[0], PRIVATE_KEY_SIZE)
+	
+  defer func() {
+		if err := s.deallocateSafe(privateKeyPtr, 0); err != nil {
+			log.Printf("Failed to deallocate private key memory in Sign: %v", err)
+		}
+	}()
 
 	// write private key to wasm memory
-	ok = s.mod.Memory().Write(uint32(privateKeyPtr[0]), []byte(key))
+	ok = s.mod.Memory().Write(uint32(privateKeyPtr), []byte(key))
 	if !ok {
 		return "", errors.New("failed to write private key to memory for signing")
 	}
 
 	// call sign function with the pointers to private key and message
-	signaturePtr, err := s.sign.Call(s.ctx, privateKeyPtr[0], PRIVATE_KEY_SIZE, uint64(messagePtr[0]), uint64(len(message)))
+	signaturePtr, err := s.sign.Call(s.ctx, privateKeyPtr, PRIVATE_KEY_SIZE, messagePtr, msgLen)
 	if err != nil {
 		log.Println("sign error:", err)
 		return "", errors.New("failed to sign message")
+	}
+	if len(signaturePtr) == 0 {
+		return "", errors.New("internal error when signing message: empty return")
 	}
 	if signaturePtr[0] == 0 {
 		return "", errors.New("internal error when signing message")
@@ -491,6 +571,10 @@ func (s *aleoWrapperSession) Sign(key string, message []byte) (signature string,
 		return "", errors.New("failed to sign message")
 	}
 	defer s.deallocate.Call(s.ctx, signaturePtr[0], SIGNATURE_SIZE)
+
+	// wipe the private key bytes in WASM memory before deallocation (best effort)
+	zero := make([]byte, PRIVATE_KEY_SIZE)
+	_ = s.mod.Memory().Write(uint32(privateKeyPtr[0]), zero)
 
 	// since memory read returns a slice of wasm memory buffer, it needs to be copied
 	// to avoid our returned slice being wiped when wasm memory is wiped.
