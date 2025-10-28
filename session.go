@@ -102,7 +102,7 @@ func (s *aleoWrapperSession) NewPrivateKey() (key []byte, address string, err er
 		return
 	}
 	if len(privKeyPtr) == 0 {
-		return "", "", errors.New("failed to create new private key: empty return")
+		return nil, "", errors.New("failed to create new private key: empty return")
 	}
 	if privKeyPtr[0] == 0 {
 		return nil, "", errors.New("failed to create new private key")
@@ -124,7 +124,7 @@ func (s *aleoWrapperSession) NewPrivateKey() (key []byte, address string, err er
 		return nil, "", errors.New("failed to get address from the generated private key")
 	}
 	if len(addressPtr) == 0 {
-		return "", "", errors.New("internal error when getting address from the generated private key: empty return")
+		return nil, "", errors.New("internal error when getting address from the generated private key: empty return")
 	}
 	if addressPtr[0] == 0 {
 		return nil, "", errors.New("internal error when getting address from the generated private key")
@@ -187,9 +187,6 @@ func (s *aleoWrapperSession) FormatMessage(message []byte, targetChunks int) (fo
 	if err != nil {
 		log.Println("message allocate error:", err)
 		return nil, errors.New("failed to allocate memory for message")
-	}
-	if len(messagePtr) == 0 {
-		return nil, errors.New("failed to allocate memory for message: empty return")
 	}
 
 	// Deallocate (capacity stored in header, second arg ignored)
@@ -272,9 +269,6 @@ func (s *aleoWrapperSession) RecoverMessage(formattedMessage []byte) (message []
 		log.Println("message allocate error:", err)
 		return nil, errors.New("failed to allocate memory for message")
 	}
-	if len(formattedMessagePtr) == 0 {
-		return nil, errors.New("failed to allocate memory for message: empty return")
-	}
 
 	// Deallocate (capacity stored in header, second arg ignored)
 	defer func() {
@@ -355,10 +349,7 @@ func (s *aleoWrapperSession) HashMessageToString(message []byte) (hash string, e
 		log.Println("message allocate error:", err)
 		return "", errors.New("failed to allocate memory for message")
 	}
-	if len(messagePtr) == 0 {
-		return "", errors.New("failed to allocate memory for message: empty return")
-	}
-
+	
 	// Deallocate (capacity stored in header, second arg ignored)
 	defer func() {
 		if err := s.deallocateSafe(messagePtr, 0); err != nil {
@@ -435,9 +426,6 @@ func (s *aleoWrapperSession) HashMessage(message []byte) (hash []byte, err error
 	if err != nil {
 		log.Println("message allocate error:", err)
 		return nil, errors.New("failed to allocate memory for message")
-	}
-	if len(messagePtr) == 0 {
-		return nil, errors.New("failed to allocate memory for message: empty return")
 	}
 
 	// Deallocate (capacity stored in header, second arg ignored)
@@ -521,7 +509,7 @@ func (s *aleoWrapperSession) Sign(key []byte, message []byte) (signature string,
 		return "", errors.New("failed to allocate memory for message")
 	}
 	
-  defer func() {
+  	defer func() {
 		if err := s.deallocateSafe(messagePtr, 0); err != nil { // second arg ignored
 			log.Printf("Failed to deallocate message memory in Sign: %v", err)
 		}
@@ -540,7 +528,7 @@ func (s *aleoWrapperSession) Sign(key []byte, message []byte) (signature string,
 		return "", errors.New("failed to allocate memory for private key")
 	}
 	
-  defer func() {
+  	defer func() {
 		if err := s.deallocateSafe(privateKeyPtr, 0); err != nil {
 			log.Printf("Failed to deallocate private key memory in Sign: %v", err)
 		}
@@ -574,7 +562,7 @@ func (s *aleoWrapperSession) Sign(key []byte, message []byte) (signature string,
 
 	// wipe the private key bytes in WASM memory before deallocation (best effort)
 	zero := make([]byte, PRIVATE_KEY_SIZE)
-	_ = s.mod.Memory().Write(uint32(privateKeyPtr[0]), zero)
+	_ = s.mod.Memory().Write(uint32(privateKeyPtr), zero)
 
 	// since memory read returns a slice of wasm memory buffer, it needs to be copied
 	// to avoid our returned slice being wiped when wasm memory is wiped.
