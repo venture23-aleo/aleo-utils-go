@@ -25,7 +25,6 @@ pub fn forget_buf_ptr_len(mut buf: Vec<u8>) -> u64 {
         ptr::write_unaligned(base.cast::<u64>(), cap as u64);
         // Copy data bytes after header
         ptr::copy_nonoverlapping(buf.as_ptr(), base.add(8), len as usize);
-        mem::forget(buf);
         let data_ptr = base.add(8) as *const u8 as usize as u64;
         mem::forget(v);
         (len << 32) | data_ptr
