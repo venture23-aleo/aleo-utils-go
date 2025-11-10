@@ -115,14 +115,14 @@ func (s *aleoWrapperSession) NewPrivateKey() (key []byte, address string, err er
 	if keyLen != PRIVATE_KEY_SIZE {
 		log.Printf("unexpected private key length %d (expected %d)", keyLen, PRIVATE_KEY_SIZE)
 	}
-	defer func(ptr uint32) {
+	defer func(ptr uint32, length uint32) {
+		// Zero out the memory first
+		zero := make([]byte, int(length))
+		_ = s.mod.Memory().Write(ptr, zero)
+		// Then deallocate
 		if err := s.deallocateSafe(uint64(ptr), 0); err != nil {
 			log.Printf("Failed to deallocate private key memory: %v", err)
 		}
-	}(keyPtr)
-	defer func(ptr uint32, length uint32) {
-		zero := make([]byte, int(length))
-		_ = s.mod.Memory().Write(ptr, zero)
 	}(keyPtr, keyLen)
 
 	// read wasm memory at pointer for the private key string
