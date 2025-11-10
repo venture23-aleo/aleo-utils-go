@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -16,10 +15,6 @@ import (
 )
 
 func TestMonitorRSS(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("rss monitor: skipping, /proc is unavailable on this platform")
-	}
-
 	log.Println("Process id:", os.Getpid())
 
 	wrapper, closeFn, err := aleo.NewWrapper()
@@ -31,11 +26,6 @@ func TestMonitorRSS(t *testing.T) {
 	s, err := wrapper.NewSession()
 	if err != nil {
 		t.Fatalf("create session: %v", err)
-	}
-
-	privKey, address, err := s.NewPrivateKey()
-	if err != nil {
-		t.Fatalf("create private key: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -57,7 +47,7 @@ func TestMonitorRSS(t *testing.T) {
 					continue
 				}
 				t.Logf("[%s] VmRSS=%d kB  VmSize=%d kB  VmHWM=%d kB  Threads=%d\n",
-			time.Now().Format("15:04:05"), stats.VmRSS, stats.VmSize, stats.VmHWM, stats.Threads)
+					time.Now().Format("15:04:05"), stats.VmRSS, stats.VmSize, stats.VmHWM, stats.Threads)
 			case <-ctx.Done():
 				return
 			}
@@ -66,7 +56,11 @@ func TestMonitorRSS(t *testing.T) {
 
 	const iterations = 5000
 	for i := 0; i < iterations; i++ {
-		formattedMessage, err := s.FormatMessage([]byte("btc/usd = 1.0"), 1)
+		privKey, address, err := s.NewPrivateKey()
+		if err != nil {
+			t.Fatalf("create private key: %v", err)
+		}
+		formattedMessage, err := s.FormatMessage([]byte("btc/usd = 1.0"), 8)
 		if err != nil {
 			t.Fatalf("format message: %v", err)
 		}
@@ -85,14 +79,14 @@ func TestMonitorRSS(t *testing.T) {
 			t.Logf("rss monitor: completed %d/%d signing iterations", i+1, iterations)
 		}
 
+		t.Logf("Generated key %s and address %s", privKey, address)
+
 		// add delay to simulate real-world usage
 		// time.Sleep(5 * time.Second)
 	}
 
 	cancel()
 	wg.Wait()
-
-	t.Log("rss monitor: final address:", address)
 }
 
 type ProcStats struct {
