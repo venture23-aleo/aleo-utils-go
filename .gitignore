@@ -5,3 +5,4 @@ cmd/gen/gen
 cmd/sgx/sgx
 cmd/sgx/*.txt
 cmd/sgx/*.json
+.DS_Store

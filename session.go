@@ -72,6 +72,10 @@ func (s *aleoWrapperSession) deallocateSafe(ptr uint64, actualCapacity uint64) e
 	return err
 }
 
+func decodeLenPtr(encoded uint64) (ptr uint32, length uint32) {
+	return uint32(encoded), uint32(encoded >> 32)
+}
+
 // NewPrivateKey generates a new Aleo private key, returns it's string representation and the address derived from that private key.
 func (s *aleoWrapperSession) NewPrivateKey() (key []byte, address string, err error) {
 	if s.mod == nil || s.mod.IsClosed() {
@@ -104,21 +108,33 @@ func (s *aleoWrapperSession) NewPrivateKey() (key []byte, address string, err er
 	if len(privKeyPtr) == 0 {
 		return nil, "", errors.New("failed to create new private key: empty return")
 	}
-	if privKeyPtr[0] == 0 {
-		return nil, "", errors.New("failed to create new private key")
+	keyPtr, keyLen := decodeLenPtr(privKeyPtr[0])
+	if keyPtr == 0 || keyLen == 0 {
+		return nil, "", errors.New("failed to create new private key: invalid pointer")
 	}
+	if keyLen != PRIVATE_KEY_SIZE {
+		log.Printf("unexpected private key length %d (expected %d)", keyLen, PRIVATE_KEY_SIZE)
+	}
+	defer func(ptr uint32) {
+		if err := s.deallocateSafe(uint64(ptr), 0); err != nil {
+			log.Printf("Failed to deallocate private key memory: %v", err)
+		}
+	}(keyPtr)
+	defer func(ptr uint32, length uint32) {
+		zero := make([]byte, int(length))
+		_ = s.mod.Memory().Write(ptr, zero)
+	}(keyPtr, keyLen)
 
 	// read wasm memory at pointer for the private key string
-	privKeyWasm, ok := s.mod.Memory().Read(uint32(privKeyPtr[0]), PRIVATE_KEY_SIZE)
+	privKeyWasm, ok := s.mod.Memory().Read(keyPtr, keyLen)
 	if !ok {
 		return nil, "", errors.New("failed to create new private key")
 	}
-	key = make([]byte, PRIVATE_KEY_SIZE)
+	key = make([]byte, int(keyLen))
 	copy(key, privKeyWasm)
-	defer s.deallocate.Call(s.ctx, privKeyPtr[0], PRIVATE_KEY_SIZE)
 
 	// get public address from the private key, reuse the returned value from private key generation
-	addressPtr, err := s.getAddress.Call(s.ctx, privKeyPtr[0], PRIVATE_KEY_SIZE)
+	addressPtr, err := s.getAddress.Call(s.ctx, uint64(keyPtr), uint64(keyLen))
 	if err != nil {
 		log.Println("get_address error:", err)
 		return nil, "", errors.New("failed to get address from the generated private key")
@@ -126,16 +142,24 @@ func (s *aleoWrapperSession) NewPrivateKey() (key []byte, address string, err er
 	if len(addressPtr) == 0 {
 		return nil, "", errors.New("internal error when getting address from the generated private key: empty return")
 	}
-	if addressPtr[0] == 0 {
+	addrPtr, addrLen := decodeLenPtr(addressPtr[0])
+	if addrPtr == 0 || addrLen == 0 {
 		return nil, "", errors.New("internal error when getting address from the generated private key")
 	}
+	if addrLen != ADDRESS_SIZE {
+		log.Printf("unexpected address length %d (expected %d)", addrLen, ADDRESS_SIZE)
+	}
+	defer func(ptr uint32) {
+		if err := s.deallocateSafe(uint64(ptr), 0); err != nil {
+			log.Printf("Failed to deallocate address memory: %v", err)
+		}
+	}(addrPtr)
 
 	// read address from wasm memory
-	addr, ok := s.mod.Memory().Read(uint32(addressPtr[0]), ADDRESS_SIZE)
+	addr, ok := s.mod.Memory().Read(addrPtr, addrLen)
 	if !ok {
 		return nil, "", errors.New("failed to convert generated private key to address")
 	}
-	defer s.deallocate.Call(s.ctx, addressPtr[0], ADDRESS_SIZE)
 
 	// since memory read returns a slice of wasm memory buffer, it needs to be copied
 	// to avoid our returned slice being wiped when wasm memory is wiped.
@@ -144,8 +168,7 @@ func (s *aleoWrapperSession) NewPrivateKey() (key []byte, address string, err er
 
 	// Now that the address has been derived and we no longer need the key inside
 	// WASM memory, wipe the original region (best effort) before returning.
-	zero := make([]byte, PRIVATE_KEY_SIZE)
-	_ = s.mod.Memory().Write(uint32(privKeyPtr[0]), zero)
+	// WASM memory for the private key is wiped via defer before deallocation
 
 	return
 }
@@ -349,7 +372,7 @@ func (s *aleoWrapperSession) HashMessageToString(message []byte) (hash string, e
 		log.Println("message allocate error:", err)
 		return "", errors.New("failed to allocate memory for message")
 	}
-	
+
 	// Deallocate (capacity stored in header, second arg ignored)
 	defer func() {
 		if err := s.deallocateSafe(messagePtr, 0); err != nil {
@@ -508,8 +531,8 @@ func (s *aleoWrapperSession) Sign(key []byte, message []byte) (signature string,
 		log.Println("message allocate error:", err)
 		return "", errors.New("failed to allocate memory for message")
 	}
-	
-  	defer func() {
+
+	defer func() {
 		if err := s.deallocateSafe(messagePtr, 0); err != nil { // second arg ignored
 			log.Printf("Failed to deallocate message memory in Sign: %v", err)
 		}
@@ -527,8 +550,8 @@ func (s *aleoWrapperSession) Sign(key []byte, message []byte) (signature string,
 		log.Println("private key allocate error:", err)
 		return "", errors.New("failed to allocate memory for private key")
 	}
-	
-  	defer func() {
+
+	defer func() {
 		if err := s.deallocateSafe(privateKeyPtr, 0); err != nil {
 			log.Printf("Failed to deallocate private key memory in Sign: %v", err)
 		}
@@ -549,16 +572,24 @@ func (s *aleoWrapperSession) Sign(key []byte, message []byte) (signature string,
 	if len(signaturePtr) == 0 {
 		return "", errors.New("internal error when signing message: empty return")
 	}
-	if signaturePtr[0] == 0 {
+	sigPtr, sigLen := decodeLenPtr(signaturePtr[0])
+	if sigPtr == 0 || sigLen == 0 {
 		return "", errors.New("internal error when signing message")
+	}
+	if sigLen != SIGNATURE_SIZE {
+		log.Printf("unexpected signature length %d (expected %d)", sigLen, SIGNATURE_SIZE)
 	}
 
 	// read signature string from memory
-	sig, ok := s.mod.Memory().Read(uint32(signaturePtr[0]), SIGNATURE_SIZE)
+	sig, ok := s.mod.Memory().Read(sigPtr, sigLen)
 	if !ok {
 		return "", errors.New("failed to sign message")
 	}
-	defer s.deallocate.Call(s.ctx, signaturePtr[0], SIGNATURE_SIZE)
+	defer func(ptr uint32) {
+		if err := s.deallocateSafe(uint64(ptr), 0); err != nil {
+			log.Printf("Failed to deallocate signature memory: %v", err)
+		}
+	}(sigPtr)
 
 	// wipe the private key bytes in WASM memory before deallocation (best effort)
 	zero := make([]byte, PRIVATE_KEY_SIZE)

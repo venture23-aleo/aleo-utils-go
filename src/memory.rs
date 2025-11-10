@@ -1,33 +1,23 @@
 use alloc::vec::Vec;
 use core::{mem, ptr};
 
-// --- Legacy helpers kept for output (hash/format) which still pack len|ptr ---
-pub fn forget_buf_ptr(mut buf: Vec<u8>) -> *const u8 {
-    // Guarantee capacity == length to make later deallocation using length safe.
-    buf.shrink_to_fit();
-    debug_assert_eq!(buf.capacity(), buf.len());
-    let ptr = buf.as_ptr();
-    mem::forget(buf);
-    ptr
-}
-
 pub fn forget_buf_ptr_len(mut buf: Vec<u8>) -> u64 {
     buf.shrink_to_fit();
     debug_assert_eq!(buf.capacity(), buf.len());
-    let len = buf.len() as u64;
-    // Allocate a new vector with header + data so dealloc (which expects a header) works uniformly.
-    // We intentionally do not reuse the original buffer to guarantee a header exists.
-    let mut v: Vec<u8> = Vec::with_capacity(len as usize + 8);
+    let len = buf.len();
+    let total_capacity = len.checked_add(8).expect("buffer too large");
+    let mut v: Vec<u8> = Vec::with_capacity(total_capacity);
     let cap = v.capacity();
     let base = v.as_mut_ptr();
     unsafe {
         // Write capacity header
         ptr::write_unaligned(base.cast::<u64>(), cap as u64);
         // Copy data bytes after header
-        ptr::copy_nonoverlapping(buf.as_ptr(), base.add(8), len as usize);
-        let data_ptr = base.add(8) as *const u8 as usize as u64;
+        ptr::copy_nonoverlapping(buf.as_ptr(), base.add(8), len);
+        mem::forget(buf);
+        let data_ptr = base.add(8) as usize as u64;
         mem::forget(v);
-        (len << 32) | data_ptr
+        ((len as u64) << 32) | data_ptr
     }
 }
 
